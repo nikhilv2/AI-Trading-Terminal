@@ -1,5 +1,11 @@
 """M5b engine: replay (no-look-ahead gateway), input forms, covariates, model runner, immutable snapshots.
-Market data comes only from the M1 cache (upstox_data.get_range). No order endpoints."""
+Market data comes only from the M1 cache (upstox_data.get_range). No order endpoints.
+
+Improvements for accuracy:
+- Default to log_price_stitched + time_of_day
+- Support for volume / range / combined covariates
+- Multi-covariate support in ModelRunner
+"""
 import hashlib
 import json
 import os
@@ -22,8 +28,12 @@ MEDIAN_IDX = 4
 STUDIO = Path(os.getenv("TIMESFM_STUDIO_DIR", r"D:\timesfm3\timesfm3-studio"))
 MODEL_DIR = Path(os.getenv("TIMESFM_MODEL_DIR", str(STUDIO / "models" / "timesfm-3.0-pytorch")))
 INPUT_FORMS = ("raw_close", "log_price_stitched", "log_returns")
-COVARIATES = ("none", "time_of_day")
-DEFAULT_SETTINGS = {"context_len": 2048, "input_form": "raw_close", "covariates": "none"}
+COVARIATES = ("none", "time_of_day", "volume", "range", "tod_volume")
+DEFAULT_SETTINGS = {
+    "context_len": 2048,
+    "input_form": "log_price_stitched",   # better than raw_close for financial data
+    "covariates": "time_of_day"           # free known-future signal
+}
 MIN = pd.Timedelta(minutes=1)
 BPS = 1e4
 SESSION_OPEN_MIN = 9 * 60 + 15      # 09:15 in minutes since midnight
@@ -102,13 +112,40 @@ def _tod_cov(ctx_df, T, horizon):
     return (mins / SESSION_SPAN)[None, :].astype(np.float32)
 
 
+def _volume_cov(ctx_df, T, horizon):
+    """Log-normalized volume. Future volume is unknown → carry forward last value."""
+    vol = ctx_df["volume"].to_numpy(dtype=np.float64)
+    recent = vol[-60:] if len(vol) >= 60 else vol
+    scale = float(np.mean(recent)) + 1e-6
+    v = np.log1p(vol / scale).astype(np.float32)
+    future = np.full(horizon, v[-1], dtype=np.float32)
+    return np.concatenate([v, future])[None, :]
+
+
+def _range_cov(ctx_df, T, horizon):
+    """Normalized high-low range (a simple volatility proxy)."""
+    hl = (ctx_df["high"] - ctx_df["low"]).to_numpy(dtype=np.float64)
+    close = ctx_df["close"].to_numpy(dtype=np.float64)
+    r = hl / (close + 1e-6)
+    recent = r[-60:] if len(r) >= 60 else r
+    mu = float(np.mean(recent))
+    sigma = float(np.std(recent)) + 1e-6
+    r = ((r - mu) / sigma).astype(np.float32)
+    future = np.full(horizon, r[-1], dtype=np.float32)
+    return np.concatenate([r, future])[None, :]
+
+
 def prepare_input(ctx_df, T, settings, horizon):
     """Returns (x, cov, back). x: 1-D model input. cov: covariate array or None.
-    back(q_raw) maps the model's (horizon, 9) output back to PRICE space."""
+    back(q_raw) maps the model's (horizon, 9) output back to PRICE space.
+
+    cov shape is (n_covariates, context_len + horizon) when present.
+    """
     check_settings(settings)
     form, cov_mode = settings["input_form"], settings["covariates"]
     close = ctx_df["close"].to_numpy(dtype=np.float64)
     last = float(close[-1])
+
     if form == "raw_close":
         x, back = close, (lambda q: q)
     else:
@@ -117,10 +154,26 @@ def prepare_input(ctx_df, T, settings, horizon):
             s = np.cumsum(r)
             x = BPS * (s - s[-1])
             back = lambda q: last * np.exp(q / BPS)
-        else:                                        # log_returns
+        else:  # log_returns
             x = BPS * r
             back = lambda q: last * np.exp(np.cumsum(q / BPS, axis=0))
-    cov = _tod_cov(ctx_df, T, horizon) if cov_mode == "time_of_day" else None
+
+    # Build covariates
+    if cov_mode == "none":
+        cov = None
+    elif cov_mode == "time_of_day":
+        cov = _tod_cov(ctx_df, T, horizon)
+    elif cov_mode == "volume":
+        cov = _volume_cov(ctx_df, T, horizon)
+    elif cov_mode == "range":
+        cov = _range_cov(ctx_df, T, horizon)
+    elif cov_mode == "tod_volume":
+        tod = _tod_cov(ctx_df, T, horizon)
+        vol = _volume_cov(ctx_df, T, horizon)
+        cov = np.concatenate([tod, vol], axis=0)  # (2, ctx+horizon)
+    else:
+        raise ValueError(f"Unknown covariates mode: {cov_mode}")
+
     return x, cov, back
 
 
@@ -146,14 +199,22 @@ class ModelRunner:
         self.output_info = None
 
     def forecast(self, x, horizon, cov=None):
-        """x: 1-D float array. cov: None or array (1, len(x)+horizon). Returns quantiles (horizon, 9)."""
+        """x: 1-D float array.
+        cov: None or array of shape (n_covariates, len(x)+horizon).
+        Returns quantiles (horizon, 9).
+        """
         arr = np.asarray(x, dtype=np.float32)
         kw = {}
         if cov is not None:
             cov = np.asarray(cov, dtype=np.float32)
-            if cov.shape != (1, len(arr) + horizon):
-                raise ValueError(f"covariate shape {cov.shape}, expected (1, {len(arr) + horizon})")
+            expected_len = len(arr) + horizon
+            if cov.ndim == 1:
+                cov = cov[None, :]
+            if cov.shape[1] != expected_len:
+                raise ValueError(f"covariate length {cov.shape[1]}, expected {expected_len}")
+            # TimesFM3 expects a list of covariate arrays (one per series)
             kw["past_future_covariates"] = [cov]
+
         outs = list(self.f.predict_batch([arr], horizon=horizon, return_quantiles=True, **kw))
         if len(outs) != 1:
             raise RuntimeError(f"expected 1 ForecastOutput, got {len(outs)}")
@@ -178,7 +239,8 @@ class ModelRunner:
 
 def forecast_at(runner, rp, T, settings, horizon):
     """The single production path: context via the gateway, input form, model, back to price.
-    Returns (q in PRICE space (horizon, 9), ctx_df, ms)."""
+    Returns (q in PRICE space (horizon, 9), ctx_df, ms).
+    """
     ctx = rp.context(T, settings["context_len"])
     if ctx.empty:
         raise RuntimeError(f"no closed bars at or before {T}")

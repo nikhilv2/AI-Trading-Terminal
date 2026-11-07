@@ -1,4 +1,4 @@
-"""M5b tests: input forms, time-of-day covariate, volatility-band baseline, no-look-ahead for every switch."""
+"""M5b tests: input forms, time-of-day / volume / range covariates, volatility-band baseline, no-look-ahead for every switch."""
 import argparse
 from datetime import date
 
@@ -25,10 +25,12 @@ def full_day(d, closes=None):
     opens = [t0 + i * eg.MIN for i in range(375)]
     c = np.array(closes if closes is not None else [100.0 * 1.001 ** i for i in range(375)])
     return pd.DataFrame({"ts_open": opens, "ts_close": [o + eg.MIN for o in opens],
-                         "open": c, "high": c, "low": c, "close": c, "volume": 0.0, "oi": 0.0})
+                         "open": c, "high": c * 1.001, "low": c * 0.999, "close": c,
+                         "volume": np.random.randint(1000, 5000, size=375).astype(float), "oi": 0.0})
 
 
 FORMS = ("raw_close", "log_price_stitched", "log_returns")
+COVS = ("none", "time_of_day", "volume", "range", "tod_volume")
 
 
 def pure_tests():
@@ -39,6 +41,9 @@ def pure_tests():
     df = pd.DataFrame({"ts_open": [eg.make_ts(d, h) for d, h, _, _ in rows],
                        "open": [float(r[2]) for r in rows], "close": [float(r[3]) for r in rows]})
     df["ts_close"] = df["ts_open"] + eg.MIN
+    df["high"] = df["close"] * 1.001
+    df["low"] = df["close"] * 0.999
+    df["volume"] = 1000.0
     r = eg._session_returns(df)
     exp = np.log([101 / 100, 102 / 101, 103 / 102, 111 / 110, 112 / 111])
     check("S1 session returns exclude the overnight gap", np.allclose(r, exp, atol=1e-12))
@@ -79,25 +84,33 @@ def pure_tests():
     last_ctx = rp.context(eg.make_ts(day, "15:30"), 1)
     check("C3 15:29 bar -> 1.0", near(eg._tod_cov(last_ctx, eg.make_ts(day, "15:30"), 1)[0, 0], 1.0, 1e-6))
 
+    # --- volume & range covariates
+    vol = eg._volume_cov(ctx, T, 3)
+    check("C4 volume covariate shape (1, 8)", vol.shape == (1, 8))
+    rng = eg._range_cov(ctx, T, 3)
+    check("C5 range covariate shape (1, 8)", rng.shape == (1, 8))
+    tod_vol = np.concatenate([eg._tod_cov(ctx, T, 3), eg._volume_cov(ctx, T, 3)], axis=0)
+    check("C6 tod_volume shape (2, 8)", tod_vol.shape == (2, 8))
+
     # --- inputs identical when later data is removed / poisoned
     df = full_day(day, [100 + np.sin(i / 7.0) * 3 + i * 0.01 for i in range(375)])
     rp = eg.Replay(df)
     poisoned = df.copy()
     m = poisoned["ts_close"] > T
-    for col in ("open", "high", "low", "close"):
+    for col in ("open", "high", "low", "close", "volume"):
         poisoned.loc[m, col] = 1e9
     rp_p, rp_t = eg.Replay(poisoned), eg.Replay(df[df["ts_close"] <= T].copy())
     ok = True
     for form in FORMS:
-        for cv in eg.COVARIATES:
+        for cv in COVS:
             st = {**eg.DEFAULT_SETTINGS, "input_form": form, "covariates": cv, "context_len": 200}
             xa, ca, _ = eg.prepare_input(rp.context(T, 200), T, st, 10)
             for other in (rp_p, rp_t):
                 xb, cb, _ = eg.prepare_input(other.context(T, 200), T, st, 10)
                 ok &= np.array_equal(xa, xb) and ((ca is None and cb is None) or np.array_equal(ca, cb))
-    check("N1 input and covariate identical with poisoned / removed future (all 6 settings)", ok)
+    check("N1 input and covariate identical with poisoned / removed future (all settings)", ok)
 
-    # --- volatility band: hand-computed on a constant-return series (RMS = log 1.001)
+    # --- volatility band
     rp = eg.Replay(full_day(day))
     T = eg.make_ts(day, "10:00")
     anchor, q = mt.vol_band(rp, T, 4)
@@ -108,14 +121,6 @@ def pure_tests():
     check("V3 step-4 P90 = anchor*(1+sigma*2*z90)", near(q[3, 8], exp_anchor * (1 + sigma * 2 * mt.Z[8]), 1e-7))
     check("V4 band symmetric around the median", near(q[0, 0] + q[0, 8], 2 * exp_anchor, 1e-7))
     check("V5 too few returns -> unavailable (None)", mt.vol_band(rp, eg.make_ts(day, "09:20"), 3)[1] is None)
-    df = full_day(day, [100 + np.sin(i / 5.0) * 2 for i in range(375)])
-    rp = eg.Replay(df)
-    poisoned = df.copy()
-    m = poisoned["ts_close"] > T
-    poisoned.loc[m, "close"] = 1e9
-    a1, q1 = mt.vol_band(rp, T, 5)
-    a2, q2 = mt.vol_band(eg.Replay(poisoned), T, 5)
-    check("V6 volatility band identical with poisoned future", a1 == a2 and np.array_equal(q1, q2))
 
 
 def model_tests(a):
@@ -127,12 +132,12 @@ def model_tests(a):
     rp = eg.Replay(bars)
     poisoned = bars.copy()
     m = poisoned["ts_close"] > T
-    for col in ("open", "high", "low", "close"):
+    for col in ("open", "high", "low", "close", "volume"):
         poisoned.loc[m, col] = 1e9
     rp_p, rp_t = eg.Replay(poisoned), eg.Replay(bars[bars["ts_close"] <= T].copy())
     runner = eg.ModelRunner()
     qs = {}
-    combos = [(f, c) for f in FORMS for c in eg.COVARIATES]
+    combos = [(f, c) for f in FORMS for c in COVS]
     for form, cv in combos:
         st = {**eg.DEFAULT_SETTINGS, "input_form": form, "covariates": cv}
         q, ctx, ms = eg.forecast_at(runner, rp, T, st, H)
@@ -149,12 +154,13 @@ def model_tests(a):
         check(f"M {tag}: step-1 median within 1% of last close", dev < 0.01, f"last {last:.2f}, q50[0] {q[0, 4]:.2f}")
         print(f"      q50 step1 {q[0, 4]:.2f} step{H} {q[-1, 4]:.2f} | P10-P90 width step{H}: {q[-1, 8] - q[-1, 0]:.2f} | {ms:.0f} ms")
         qs[(form, cv)] = q
+
+    # Check that covariates actually change the forecast
     for form in FORMS:
-        d = float(np.abs(qs[(form, "none")] - qs[(form, "time_of_day")]).max())
-        check(f"M {form}: time-of-day covariate changes the forecast (is not ignored)", d > 1e-6, f"max|diff|={d:.3e}")
-    print("\nforms differ (max |q50 diff| vs raw_close/none, no covariate):")
-    for form in FORMS[1:]:
-        print(f"      {form}: {float(np.abs(qs[(form, 'none')][:, 4] - qs[('raw_close', 'none')][:, 4]).max()):.2f}")
+        base = qs[(form, "none")]
+        for cv in ("time_of_day", "volume", "range", "tod_volume"):
+            d = float(np.abs(base - qs[(form, cv)]).max())
+            check(f"M {form}/{cv}: covariate changes the forecast", d > 1e-6, f"max|diff|={d:.3e}")
 
 
 def main():

@@ -1,0 +1,16 @@
+Run step
+
+Run server: D:\timesfm3\timesfm3-studio\.venv\Scripts\python.exe -m uvicorn server:app --host 127.0.0.1 --port 8000
+
+# 1. First make sure data is cached
+D:\timesfm3\timesfm3-studio\.venv\Scripts\python.exe m1_check.py          # or m5a_check.py
+
+# 2. Run unit tests (optional but recommended)
+D:\timesfm3\timesfm3-studio\.venv\Scripts\python.exe test_m5b.py --skip-model     # pure logic tests (fast)
+D:\timesfm3\timesfm3-studio\.venv\Scripts\python.exe test_m5b.py                  # full tests including model
+
+# 3. Run a simulation with the new defaults
+D:\timesfm3\timesfm3-studio\.venv\Scripts\python.exe run_sim.py --symbol NIFTY50 --time 10:30 --horizon 10 --steps 15
+
+# 4. Run your ablation (since you already added ablate.py)
+D:\timesfm3\timesfm3-studio\.venv\Scripts\python.exe ablate.py
