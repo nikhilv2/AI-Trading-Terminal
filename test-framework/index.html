@@ -1,0 +1,266 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>TimesFM test terminal</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+<style>
+body{font-family:system-ui,sans-serif;margin:0;background:#fafafa;color:#222}
+#bar{display:flex;flex-wrap:wrap;gap:8px;align-items:flex-end;padding:8px 12px;background:#fff;border-bottom:1px solid #ddd}
+label{font-size:12px;color:#555;display:flex;flex-direction:column;gap:2px}
+input,select,button{font-size:14px;padding:4px 6px}
+button{cursor:pointer}button:disabled{opacity:.4;cursor:default}
+.sep{width:1px;height:34px;background:#ddd}
+#info{padding:6px 12px;font-size:13px}#msg{margin-left:12px}
+#chart{height:calc(100vh - 118px)}
+#cmp{display:none;padding:8px 14px 40px;background:#fff;border-top:2px solid #ddd}
+#cmp h3{margin:8px 0 4px}#cmpnote{font-size:12px;color:#555;margin:4px 0}
+#warn{font-size:12px;color:#b45f00;margin:4px 0}
+table.t{border-collapse:collapse;font-size:12px;margin:6px 0}
+table.t th,table.t td{border:1px solid #ddd;padding:3px 7px;text-align:right;white-space:nowrap}
+table.t th{background:#f3f3f3}
+table.t td:first-child,table.t th:first-child{text-align:left}
+tr.sh td{background:#fff6e5}
+.ok{color:#1b7f3b}.bad{color:#c62828}
+.row{display:flex;align-items:center;gap:6px;font-size:13px;margin:4px 0}
+.chk{font-size:13px;color:#222;display:flex;gap:10px;align-items:center;padding:4px 0}
+</style></head><body>
+<div id="bar">
+ <label>Benchmark<select id="symbol"></select></label>
+ <label>Date<input type="date" id="date"></label>
+ <label>Time (start)<input type="time" id="time" value="10:30"></label>
+ <label>Horizon (bars)<input type="number" id="horizon" value="10" min="1" max="60" style="width:70px"></label>
+ <label>Context<select id="ctx"><option>2048</option><option>1024</option><option>512</option><option>256</option></select></label>
+ <label>Input form<select id="form"><option value="raw_close">raw close</option><option value="log_price_stitched">gap-stitched log price</option><option value="log_returns">log returns</option></select></label>
+ <label>Covariates<select id="cov"><option value="none">none</option><option value="time_of_day">time of day</option></select></label>
+ <label>Run length<select id="steps" onchange="onSteps()"><option value="10">10 min</option><option value="30">30 min</option><option value="60">60 min</option></select></label>
+ <button id="bLoad" onclick="load()">Load</button>
+ <div class="sep"></div>
+ <button id="bStart" onclick="start()" disabled>Start</button>
+ <button id="bPlay" onclick="togglePlay()" disabled>Play</button>
+ <button id="bStep" onclick="doStep()" disabled>Step</button>
+ <label>Speed<select id="speed"><option value="1">1x</option><option value="2">2x</option><option value="5">5x</option><option value="10" selected>10x</option><option value="20">20x</option><option value="30">30x</option></select></label>
+ <label>Follow<input type="checkbox" id="follow" checked onchange="render()"></label>
+ <button id="bReset" onclick="reset()" disabled>Reset</button>
+ <button id="bCompare" onclick="showCmp(true)" disabled>Compare</button>
+</div>
+<div id="info"><span id="st">not loaded</span><span id="msg"></span></div>
+<div id="chart"></div>
+<div id="cmp">
+ <h3>Comparison: initial vs latest forecast vs actual</h3>
+ <div id="cmpnote"></div>
+ <div id="warn"></div>
+ <div class="chk"><b>Baselines:</b>
+  <label style="flex-direction:row;gap:4px;color:#222"><input type="checkbox" id="bNC" checked onchange="drawCmp()">no-change</label>
+  <label style="flex-direction:row;gap:4px;color:#222"><input type="checkbox" id="bVB" checked onchange="drawCmp()">volatility band</label>
+ </div>
+ <div class="row"><input type="checkbox" id="indep" onchange="drawCmp()"><span>Summary: exclude rows where the latest forecast IS the initial one (shaded rows)</span></div>
+ <div id="cmpsum"></div>
+ <div id="cmpchart" style="height:380px"></div>
+ <div id="cmptab" style="overflow-x:auto"></div>
+</div>
+<script>
+const $=id=>document.getElementById(id);
+const E=()=>({x:[],open:[],high:[],low:[],close:[]});
+const plus=(s,m)=>new Date(Date.parse(s.replace(" ","T")+"Z")+m*60000).toISOString().slice(0,19).replace("T"," ");
+let L=null,rev=E(),snaps=[],running=false,busy=false,started=false,done=false,lid=0,timer=null,CMP=null,curSteps=10;
+
+async function api(p,b){
+  const r=await fetch(p,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(b||{})});
+  let j={};try{j=await r.json()}catch(e){}
+  if(!r.ok)throw new Error(j.detail||("HTTP "+r.status));
+  return j;
+}
+async function getJ(p){
+  const r=await fetch(p);let j={};try{j=await r.json()}catch(e){}
+  if(!r.ok)throw new Error(j.detail||("HTTP "+r.status));
+  return j;
+}
+function say(t,err){$("msg").textContent=t||"";$("msg").style.color=err?"#c62828":"#333"}
+function ui(){
+  const ld=!!L;
+  $("bStart").disabled=!ld||started;
+  $("bPlay").disabled=!started||done;$("bPlay").textContent=running?"Pause":"Play";
+  $("bStep").disabled=!started||done||running||busy;
+  $("bReset").disabled=!ld;
+  $("bCompare").disabled=!(started&&snaps.length>1);
+  let s=ld?$("symbol").value+" "+$("date").value+" | "+L.settings.input_form+" / "+L.settings.covariates+" / ctx "+L.settings.context_len:"not loaded";
+  if(snaps.length){const l=snaps[snaps.length-1];s+=" | now "+l.origin.slice(11,16)+" | forecasts "+snaps.length+" | last "+l.infer_ms+" ms"}
+  s+=done?" | finished":running?" | running":started?" | paused":"";
+  $("st").textContent=s;
+}
+function hideCmp(){CMP=null;$("cmp").style.display="none"}
+async function load(){
+  running=false;clearTimeout(timer);
+  try{
+    say("Loading (fetches missing days on first use)...");
+    L=await api("/api/load",{symbol:$("symbol").value,date:$("date").value,time:$("time").value,
+      horizon:+$("horizon").value,ctx:+$("ctx").value,steps:+$("steps").value,
+      input_form:$("form").value,covariates:$("cov").value});
+    curSteps=+$("steps").value;
+    lid++;rev=E();snaps=[];started=false;done=false;hideCmp();say("");render();
+  }catch(e){say(e.message,true)}
+  ui();
+}
+async function onSteps(){
+  if(!L)return;
+  const v=+$("steps").value;
+  try{
+    const r=await api("/api/extend",{steps:v});
+    curSteps=r.steps;done=r.done;
+    say("Run length set to "+r.steps+" bars"+(started&&!done?" - press Play or Step to continue":""));
+  }catch(e){$("steps").value=curSteps;say(e.message,true)}
+  ui();
+}
+async function start(){
+  try{const r=await api("/api/start");snaps=[r.snap];started=true;render();running=true;ui();schedule()}
+  catch(e){say(e.message,true)}
+  ui();
+}
+function schedule(){
+  clearTimeout(timer);if(!running)return;
+  timer=setTimeout(async()=>{const ok=await doStep();if(ok)schedule()},60000/+$("speed").value);
+}
+function togglePlay(){running=!running;clearTimeout(timer);if(running)schedule();ui()}
+async function doStep(){
+  if(busy)return true;busy=true;ui();
+  try{
+    const r=await api("/api/step");
+    if(r.done){running=false;done=true;say("Finished: "+r.reason);showCmp(false);return false}
+    for(const k in rev)rev[k].push(r.bar[k]);
+    snaps.push(r.snap);render();
+    if(r.finished){running=false;done=true;say("Finished: "+r.finished+" - comparison is below the chart");showCmp(false);return false}
+    return true;
+  }catch(e){running=false;say(e.message,true);return false}
+  finally{busy=false;ui()}
+}
+async function reset(){
+  running=false;clearTimeout(timer);
+  try{await api("/api/reset");lid++;rev=E();snaps=[];started=false;done=false;hideCmp();say("");render()}
+  catch(e){say(e.message,true)}
+  ui();
+}
+function fc(){
+  if(!snaps.length)return[];
+  const t=[],ini=snaps[0],last=snaps[snaps.length-1];
+  const band=(s,fill)=>[
+    {x:s.targets,y:s.p10,mode:"lines",line:{width:0},hoverinfo:"skip",showlegend:false},
+    {x:s.targets,y:s.p90,mode:"lines",line:{width:0},fill:"tonexty",fillcolor:fill,hoverinfo:"skip",showlegend:false}];
+  snaps.slice(1,-1).forEach(s=>t.push({x:s.targets,y:s.median,mode:"lines",
+    line:{color:"rgba(30,100,220,0.22)",width:1},hoverinfo:"skip",showlegend:false}));
+  if(snaps.length>1){
+    t.push(...band(last,"rgba(30,100,220,0.12)"));
+    t.push({x:last.targets,y:last.median,mode:"lines+markers",line:{color:"rgb(30,100,220)",width:2.5},
+      marker:{size:5},name:"latest forecast (origin "+last.origin.slice(11,16)+")"});
+  }
+  t.push(...band(ini,"rgba(255,140,0,0.14)"));
+  t.push({x:ini.targets,y:ini.median,mode:"lines+markers",line:{color:"rgb(255,140,0)",width:2.5,dash:"dot"},
+    marker:{size:5},name:"initial forecast (frozen, "+ini.origin.slice(11,16)+")"});
+  return t;
+}
+function render(){
+  if(!L)return;
+  const d=E();[L.prev,L.today,rev].forEach(a=>{for(const k in d)d[k].push(...a[k])});
+  const n=d.x.length,i0=Math.max(0,n-90),follow=$("follow").checked;
+  const lay={margin:{l:60,r:20,t:20,b:40},legend:{orientation:"h",y:1.06},
+    xaxis:{type:"date",rangeslider:{visible:false},
+      rangebreaks:[{bounds:["sat","mon"]},{pattern:"hour",bounds:[15.5,9.25]}]},
+    uirevision:follow?Math.random():lid};
+  if(follow){
+    const last=snaps[snaps.length-1],ini=snaps[0];
+    const endx=last?last.targets[last.targets.length-1]:d.x[n-1];
+    let lo=Math.min(...d.low.slice(i0)),hi=Math.max(...d.high.slice(i0));
+    [ini,last].forEach(s=>{if(s){lo=Math.min(lo,...s.p10);hi=Math.max(hi,...s.p90)}});
+    const pad=(hi-lo)*0.1||1;
+    lay.xaxis.range=[d.x[i0],plus(endx,2)];lay.yaxis={range:[lo-pad,hi+pad]};
+  }
+  Plotly.react("chart",[{type:"candlestick",...d,name:"actual 1-min"},...fc()],lay,{responsive:true});
+}
+
+/* ---------- comparison ---------- */
+const f2=v=>v==null?"-":(+v).toFixed(2);
+const sg=v=>v==null?"-":(v>0?"+":"")+(+v).toFixed(2);
+const fr=a=>a&&a[1]?a[0]+"/"+a[1]+" ("+(100*a[0]/a[1]).toFixed(0)+"%)":"-";
+const tick=v=>v==null?"-":(v?"\u2713":"\u2717");
+const cls=v=>v==null?"":(v?"ok":"bad");
+async function showCmp(manual){
+  try{
+    CMP=await getJ("/api/compare");
+    $("cmp").style.display="block";drawCmp();
+    if(manual)$("cmp").scrollIntoView({behavior:"smooth"});
+  }catch(e){if(manual)say(e.message,true)}
+}
+function summaryHtml(sm){
+  const m=sm.mae,rt=sm.mae_ratio,nc=$("bNC").checked,vb=$("bVB").checked;
+  const cols=[
+    {h:"Initial",n:sm.n_initial,mae:f2(m.initial),rat:f2(rt.initial),dir:fr(sm.direction.initial),cov:fr(sm.coverage.initial),pin:f2(sm.pinball.initial)},
+    {h:"Latest",n:sm.n_latest,mae:f2(m.latest),rat:f2(rt.latest),dir:fr(sm.direction.latest),cov:fr(sm.coverage.latest),pin:f2(sm.pinball.latest)},
+    nc&&{h:"No-change (T0 anchor)",n:sm.n_initial,mae:f2(m.nc_fixed),rat:"-",dir:"n/a",cov:"n/a",pin:"n/a"},
+    nc&&{h:"No-change (prev bar)",n:sm.n_latest,mae:f2(m.nc_roll),rat:"-",dir:"n/a",cov:"n/a",pin:"n/a"},
+    vb&&{h:"Vol band (T0 anchor)",n:sm.n_initial,mae:f2(m.nc_fixed)+" *",rat:"-",dir:"n/a",cov:fr(sm.coverage_vb.initial),pin:f2(sm.pinball_vb.initial)},
+    vb&&{h:"Vol band (prev bar)",n:sm.n_latest,mae:f2(m.nc_roll)+" *",rat:"-",dir:"n/a",cov:fr(sm.coverage_vb.latest),pin:f2(sm.pinball_vb.latest)}
+  ].filter(Boolean);
+  const line=(lab,k)=>"<tr><td>"+lab+"</td>"+cols.map(c=>"<td>"+c[k]+"</td>").join("")+"</tr>";
+  return '<table class="t"><tr><th></th>'+cols.map(c=>"<th>"+c.h+"</th>").join("")+"</tr>"
+    +line("targets scored","n")+line("MAE (median vs actual close)","mae")+line("MAE ratio vs matching no-change","rat")
+    +line("Direction hit (vs own anchor)","dir")+line("P10-P90 coverage (nominal 80%)","cov")
+    +line("Mean pinball (9 quantiles)","pin")+"</table>"
+    +(vb?'<div style="font-size:12px;color:#555">* the volatility band\'s median is the anchor, so its MAE equals the matching no-change MAE; it adds coverage and pinball.</div>':"");
+}
+function tableHtml(rows){
+  const nc=$("bNC").checked,vb=$("bVB").checked;
+  const band=(a,b)=>a==null?"-":f2(a)+" - "+f2(b);
+  let h='<table class="t"><tr><th>Target (bar open)</th><th>Initial Q50</th><th>Initial P10-P90</th><th>In band</th><th>Dir</th>'
+   +'<th>Latest Q50</th><th>Latest origin</th><th>Latest P10-P90</th><th>In band</th><th>Dir</th><th>Actual close</th>';
+  if(nc)h+='<th>No-change (T0)</th><th>No-change (prev bar)</th>';
+  if(vb)h+='<th>VB initial P10-P90</th><th>In</th><th>VB latest P10-P90</th><th>In</th>';
+  h+='<th>Err initial</th><th>Err latest</th>';
+  if(nc)h+='<th>Err NC (T0)</th><th>Err NC (prev)</th>';
+  h+='</tr>';
+  rows.forEach(r=>{
+    h+='<tr class="'+(r.latest_is_initial?"sh":"")+'"><td>'+r.target.slice(11,16)+'</td>'
+     +'<td>'+f2(r.init_q50)+'</td><td>'+band(r.init_p10,r.init_p90)+'</td>'
+     +'<td class="'+cls(r.in_init)+'">'+tick(r.in_init)+'</td><td class="'+cls(r.dir_init)+'">'+tick(r.dir_init)+'</td>'
+     +'<td>'+f2(r.latest_q50)+'</td><td>'+r.latest_origin.slice(11,16)+'</td><td>'+band(r.latest_p10,r.latest_p90)+'</td>'
+     +'<td class="'+cls(r.in_latest)+'">'+tick(r.in_latest)+'</td><td class="'+cls(r.dir_latest)+'">'+tick(r.dir_latest)+'</td>'
+     +'<td><b>'+f2(r.actual)+'</b></td>';
+    if(nc)h+='<td>'+f2(r.nc_fixed)+'</td><td>'+f2(r.nc_roll)+'</td>';
+    if(vb)h+='<td>'+band(r.vb_init_p10,r.vb_init_p90)+'</td><td class="'+cls(r.in_vb_init)+'">'+tick(r.in_vb_init)+'</td>'
+        +'<td>'+band(r.vb_latest_p10,r.vb_latest_p90)+'</td><td class="'+cls(r.in_vb_latest)+'">'+tick(r.in_vb_latest)+'</td>';
+    h+='<td>'+sg(r.err_init)+'</td><td>'+sg(r.err_latest)+'</td>';
+    if(nc)h+='<td>'+sg(r.err_nc_fixed)+'</td><td>'+sg(r.err_nc_roll)+'</td>';
+    h+='</tr>';
+  });
+  return h+"</table>";
+}
+function drawCmp(){
+  if(!CMP)return;
+  const rows=CMP.rows,sm=$("indep").checked?CMP.summary_indep:CMP.summary_all;
+  const nc=$("bNC").checked,vb=$("bVB").checked,st=CMP.settings;
+  $("cmpnote").textContent="Origin "+CMP.origin.slice(11,16)+" | "+CMP.n_revealed+" revealed bars | input "+st.input_form+" | covariates "+st.covariates+" | ctx "+st.context_len+" | values are predicted bar CLOSES, shown at the bar's open stamp | err = forecast - actual | latest = last forecast made before the bar was revealed (lag "+CMP.lag+") | shaded rows: latest is the initial forecast itself";
+  $("warn").textContent=CMP.band_approx?"Log-returns input: P10-P90 bands are an approximation (quantiles of each step summed). Median and MAE are fine to compare; coverage and pinball are not comparable with the other input forms.":"";
+  $("cmpsum").innerHTML=summaryHtml(sm);
+  const x=rows.map(r=>r.target.slice(0,19).replace("T"," "));
+  const y=k=>rows.map(r=>r[k]);
+  const tr=[
+    {x,y:y("init_p10"),mode:"lines",line:{width:0},hoverinfo:"skip",showlegend:false},
+    {x,y:y("init_p90"),mode:"lines",line:{width:0},fill:"tonexty",fillcolor:"rgba(255,140,0,0.15)",name:"initial P10-P90"},
+    {x,y:y("init_q50"),mode:"lines+markers",line:{color:"rgb(255,140,0)",dash:"dot",width:2},name:"initial median"},
+    {x,y:y("latest_q50"),mode:"lines+markers",line:{color:"rgb(30,100,220)",width:2},name:"latest median (before reveal)"}];
+  if(vb){
+    tr.push({x,y:y("vb_init_p10"),mode:"lines",line:{width:0},hoverinfo:"skip",showlegend:false});
+    tr.push({x,y:y("vb_init_p90"),mode:"lines",line:{width:0},fill:"tonexty",fillcolor:"rgba(120,120,120,0.15)",name:"vol band (T0) P10-P90"});
+  }
+  if(nc){
+    tr.push({x,y:y("nc_fixed"),mode:"lines",line:{color:"#888",dash:"dash",width:1},name:"no-change (T0)"});
+    tr.push({x,y:y("nc_roll"),mode:"lines",line:{color:"#bbb",dash:"dot",width:1},name:"no-change (prev bar)"});
+  }
+  tr.push({x,y:y("actual"),mode:"lines+markers",line:{color:"#111",width:2},name:"actual close"});
+  Plotly.newPlot("cmpchart",tr,{margin:{l:60,r:20,t:10,b:40},legend:{orientation:"h",y:1.15},
+    xaxis:{type:"date"},yaxis:{title:"price"}},{responsive:true});
+  $("cmptab").innerHTML=tableHtml(rows);
+}
+
+fetch("/api/meta").then(r=>r.json()).then(m=>{
+  m.symbols.forEach(s=>{const o=document.createElement("option");o.textContent=s;$("symbol").appendChild(o)});
+  if(m.latest)$("date").value=m.latest;
+});
+</script></body></html>
