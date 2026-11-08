@@ -33,6 +33,7 @@ class LoadReq(BaseModel):
     symbol: str = "NIFTY50"
     date: str
     time: str
+    interval: int = 1          # bar size in minutes; horizon, ctx and steps below are counted in bars of this size
     horizon: int = 10
     ctx: int = 2048
     steps: int = 10
@@ -63,6 +64,7 @@ def need():
 
 def make_snap(s, seq, kind, T):
     H = s["horizon"]
+    step = eg.step_of(s["settings"])
     try:
         q, ctx, ms = eg.forecast_at(S["runner"], s["rp"], T, s["settings"], H)
     except Exception as e:
@@ -72,7 +74,8 @@ def make_snap(s, seq, kind, T):
         "last_context_bar_open": ctx["ts_open"].iloc[-1].isoformat(),
         "n_context_bars": int(len(ctx)),
         "context_sha256": hashlib.sha256(ctx["close"].to_numpy(np.float64).tobytes()).hexdigest(),
-        "horizon": H, "target_open_ts": [(T + i * eg.MIN).isoformat() for i in range(H)],
+        "interval": s["settings"]["interval"],
+        "horizon": H, "target_open_ts": [(T + i * step).isoformat() for i in range(H)],
         "quantile_levels": eg.QLEVELS, "quantiles": q.tolist(), "median": q[:, eg.MEDIAN_IDX].tolist(),
         "quantile_crossing": bool(np.any(np.diff(q, axis=1) < 0)),
         "band_approx": s["settings"]["input_form"] == "log_returns",
@@ -80,7 +83,7 @@ def make_snap(s, seq, kind, T):
         "infer_ms": round(ms, 1), "created_utc": datetime.utcnow().isoformat() + "Z"}
     eg.write_snapshot(s["run_dir"], snap)
     return {"seq": seq, "kind": kind, "origin": fmt(T),
-            "targets": [fmt(T + i * eg.MIN) for i in range(H)],
+            "targets": [fmt(T + i * step) for i in range(H)],
             "p10": q[:, 0].round(2).tolist(), "median": q[:, eg.MEDIAN_IDX].round(2).tolist(),
             "p90": q[:, 8].round(2).tolist(), "q": q.round(3).tolist(), "infer_ms": snap["infer_ms"]}
 
@@ -97,7 +100,8 @@ def meta():
         latest = str(eg.latest_cached_day(sym))
     except SystemExit:
         latest = ""
-    return {"symbols": list(ud.SYMBOLS), "latest": latest}
+    return {"symbols": list(ud.SYMBOLS), "latest": latest, "intervals": list(eg.INTERVALS),
+            "defaults": {str(k): v for k, v in eg.INTERVAL_DEFAULTS.items()}}
 
 
 @app.post("/api/load")
@@ -107,17 +111,21 @@ def load(r: LoadReq):
             if r.symbol not in ud.SYMBOLS:
                 raise ValueError("unknown symbol")
             if not (1 <= r.horizon <= 60) or r.ctx not in (256, 512, 1024, 2048):
-                raise ValueError("horizon must be 1..60, context one of 256/512/1024/2048")
+                raise ValueError("horizon must be 1..60 bars, context one of 256/512/1024/2048 bars")
             if not (1 <= r.steps <= 60):
-                raise ValueError("run length must be 1..60")
-            settings = {**eg.DEFAULT_SETTINGS, "context_len": r.ctx,
+                raise ValueError("run length must be 1..60 bars")
+            settings = {**eg.DEFAULT_SETTINGS, "context_len": r.ctx, "interval": r.interval,
                         "input_form": r.input_form, "covariates": r.covariates}
             eg.check_settings(settings)
             day = date.fromisoformat(r.date)
             T0 = eg.make_ts(day, r.time)
             if not (eg.make_ts(day, "09:15") <= T0 < eg.make_ts(day, "15:30")):
                 raise ValueError("time must be 09:15..15:29")
-            bars = eg.load_history(r.symbol, day, r.ctx)
+            T0g = eg.snap_to_grid(T0, r.interval)        # origins must sit on the bar grid (09:15 + n * interval)
+            if T0g >= eg.make_ts(day, "15:30"):
+                raise ValueError(f"no {r.interval}-min bar boundary between {r.time} and 15:30; start earlier")
+            snapped, T0 = T0g != T0, T0g
+            bars = eg.load_history(r.symbol, day, r.ctx, r.interval)
             if bars[bars["ts_open"].dt.date == day].empty:
                 raise ValueError(f"no cached bars for {day} (weekend, holiday, or today)")
         except (Exception, SystemExit) as e:
@@ -127,11 +135,11 @@ def load(r: LoadReq):
         today = today[today["ts_open"].dt.date == day]
         dates = sorted({t.date() for t in bars["ts_open"] if t.date() < day})[-3:]
         prev = bars[bars["ts_open"].dt.date.isin(dates)]
-        S["sess"] = {"rp": rp, "T0": T0, "sym": r.symbol, "day": day, "start": r.time,
+        S["sess"] = {"rp": rp, "T0": T0, "sym": r.symbol, "day": day, "start": f"{T0:%H:%M}",
                      "horizon": r.horizon, "settings": settings,
                      "steps": r.steps, "k": 0, "run_dir": None, "done": False, "done_why": None}
         return {"prev": candles(prev), "today": candles(today), "T0": fmt(T0), "horizon": r.horizon,
-                "settings": settings}
+                "interval": r.interval, "snapped": snapped, "settings": settings}
 
 
 @app.post("/api/start")
@@ -140,13 +148,13 @@ def start():
         s = need()
         if s["run_dir"] is not None:
             raise HTTPException(400, "Already started; press Reset first")
-        rd = eg.RUNS / (f"{s['sym']}_{s['day']}_{s['start'].replace(':', '')}_h{s['horizon']}"
-                        f"_c{s['settings']['context_len']}_{datetime.now():%H%M%S}")
-        rd.mkdir(parents=True, exist_ok=False)
+        rd = eg.make_run_dir(f"{s['sym']}_{s['day']}_{s['start'].replace(':', '')}_i{s['settings']['interval']}_h{s['horizon']}"
+                             f"_c{s['settings']['context_len']}")
         eg._write_once(rd / "run.json", {
-            "symbol": s["sym"], "date": str(s["day"]), "start": s["start"], "horizon": s["horizon"],
+            "symbol": s["sym"], "date": str(s["day"]), "start": s["start"],
+            "interval": s["settings"]["interval"], "horizon": s["horizon"],
             "settings": s["settings"], "model": S["runner"].info, "source": "gui",
-            "bar_convention": "ts_open = bar open; context = bars with ts_close <= origin",
+            "bar_convention": "ts_open = bar open; context = bars with ts_close <= origin; bar = `interval` minutes",
             "created": datetime.now(eg.IST).isoformat()})
         s["run_dir"] = rd
         return {"snap": make_snap(s, 0, "initial", s["T0"])}
@@ -154,7 +162,7 @@ def start():
 
 @app.post("/api/extend")
 def extend(r: ExtReq):
-    """Change the run length (10/30/60 in the GUI). Can be raised after the run finished."""
+    """Change the run length in bars (see the GUI list). Can be raised after the run finished."""
     with LOCK:
         s = need()
         if not (1 <= r.steps <= 60):
@@ -183,7 +191,7 @@ def step():
         if s["done"]:
             return {"done": True, "reason": why_text(s)}
         k = s["k"] + 1
-        Tk = s["T0"] + k * eg.MIN
+        Tk = s["T0"] + k * eg.step_of(s["settings"])
         bar = s["rp"].bar_closing_at(Tk)
         why = None
         if k > s["steps"]:

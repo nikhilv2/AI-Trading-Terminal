@@ -26,12 +26,13 @@ tr.sh td{background:#fff6e5}
 <div id="bar">
  <label>Benchmark<select id="symbol"></select></label>
  <label>Date<input type="date" id="date"></label>
- <label>Time (start)<input type="time" id="time" value="10:30"></label>
+ <label>Time (start)<input type="time" id="time" value="10:30" title="moved to the next bar boundary (09:15 + n x interval) if needed"></label>
+ <label>Interval<select id="iv" onchange="onInterval()"></select></label>
  <label>Horizon (bars)<input type="number" id="horizon" value="10" min="1" max="60" style="width:70px"></label>
  <label>Context<select id="ctx"><option>2048</option><option>1024</option><option>512</option><option>256</option></select></label>
  <label>Input form<select id="form"><option value="raw_close">raw close</option><option value="log_price_stitched">gap-stitched log price</option><option value="log_returns">log returns</option></select></label>
  <label>Covariates<select id="cov"><option value="none">none</option><option value="time_of_day">time of day</option></select></label>
- <label>Run length<select id="steps" onchange="onSteps()"><option value="10">10 min</option><option value="30">30 min</option><option value="60">60 min</option></select></label>
+ <label>Run length<select id="steps" onchange="onSteps()"><option value="6">6 bars</option><option value="10">10 bars</option><option value="12">12 bars</option><option value="30">30 bars</option><option value="60">60 bars</option></select></label>
  <button id="bLoad" onclick="load()">Load</button>
  <div class="sep"></div>
  <button id="bStart" onclick="start()" disabled>Start</button>
@@ -61,7 +62,7 @@ tr.sh td{background:#fff6e5}
 const $=id=>document.getElementById(id);
 const E=()=>({x:[],open:[],high:[],low:[],close:[]});
 const plus=(s,m)=>new Date(Date.parse(s.replace(" ","T")+"Z")+m*60000).toISOString().slice(0,19).replace("T"," ");
-let L=null,rev=E(),snaps=[],running=false,busy=false,started=false,done=false,lid=0,timer=null,CMP=null,curSteps=10;
+let L=null,rev=E(),snaps=[],running=false,busy=false,started=false,done=false,lid=0,timer=null,CMP=null,curSteps=10,META=null;
 
 async function api(p,b){
   const r=await fetch(p,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(b||{})});
@@ -82,7 +83,7 @@ function ui(){
   $("bStep").disabled=!started||done||running||busy;
   $("bReset").disabled=!ld;
   $("bCompare").disabled=!(started&&snaps.length>1);
-  let s=ld?$("symbol").value+" "+$("date").value+" | "+L.settings.input_form+" / "+L.settings.covariates+" / ctx "+L.settings.context_len:"not loaded";
+  let s=ld?$("symbol").value+" "+$("date").value+" | "+L.interval+" min bars | "+L.settings.input_form+" / "+L.settings.covariates+" / ctx "+L.settings.context_len+" bars | horizon "+L.horizon+" bars (+"+(L.horizon*L.interval)+" min)":"not loaded";
   if(snaps.length){const l=snaps[snaps.length-1];s+=" | now "+l.origin.slice(11,16)+" | forecasts "+snaps.length+" | last "+l.infer_ms+" ms"}
   s+=done?" | finished":running?" | running":started?" | paused":"";
   $("st").textContent=s;
@@ -93,12 +94,22 @@ async function load(){
   try{
     say("Loading (fetches missing days on first use)...");
     L=await api("/api/load",{symbol:$("symbol").value,date:$("date").value,time:$("time").value,
-      horizon:+$("horizon").value,ctx:+$("ctx").value,steps:+$("steps").value,
+      interval:+$("iv").value,horizon:+$("horizon").value,ctx:+$("ctx").value,steps:+$("steps").value,
       input_form:$("form").value,covariates:$("cov").value});
     curSteps=+$("steps").value;
-    lid++;rev=E();snaps=[];started=false;done=false;hideCmp();say("");render();
+    lid++;rev=E();snaps=[];started=false;done=false;hideCmp();
+    $("time").value=L.T0.slice(11,16);
+    say(L.snapped?"Start moved to "+L.T0.slice(11,16)+" (next "+L.interval+"-min bar boundary)":"");
+    render();
   }catch(e){say(e.message,true)}
   ui();
+}
+function onInterval(){
+  /* sensible context / horizon / run length for the chosen bar size (single source: engine.INTERVAL_DEFAULTS) */
+  const d=META&&META.defaults[$("iv").value];
+  if(!d)return;
+  $("ctx").value=d.context_len;$("horizon").value=d.horizon;$("steps").value=d.steps;
+  say("Interval "+$("iv").value+" min: context "+d.context_len+" bars, horizon "+d.horizon+" bars (+"+(d.horizon*+$("iv").value)+" min). Press Load to apply.");
 }
 async function onSteps(){
   if(!L)return;
@@ -106,7 +117,7 @@ async function onSteps(){
   try{
     const r=await api("/api/extend",{steps:v});
     curSteps=r.steps;done=r.done;
-    say("Run length set to "+r.steps+" bars"+(started&&!done?" - press Play or Step to continue":""));
+    say("Run length set to "+r.steps+" bars ("+(r.steps*L.interval)+" min)"+(started&&!done?" - press Play or Step to continue":""));
   }catch(e){$("steps").value=curSteps;say(e.message,true)}
   ui();
 }
@@ -117,7 +128,7 @@ async function start(){
 }
 function schedule(){
   clearTimeout(timer);if(!running)return;
-  timer=setTimeout(async()=>{const ok=await doStep();if(ok)schedule()},60000/+$("speed").value);
+  timer=setTimeout(async()=>{const ok=await doStep();if(ok)schedule()},60000*(L?L.interval:1)/+$("speed").value);
 }
 function togglePlay(){running=!running;clearTimeout(timer);if(running)schedule();ui()}
 async function doStep(){
@@ -170,7 +181,7 @@ function render(){
     let lo=Math.min(...d.low.slice(i0)),hi=Math.max(...d.high.slice(i0));
     [ini,last].forEach(s=>{if(s){lo=Math.min(lo,...s.p10);hi=Math.max(hi,...s.p90)}});
     const pad=(hi-lo)*0.1||1;
-    lay.xaxis.range=[d.x[i0],plus(endx,2)];lay.yaxis={range:[lo-pad,hi+pad]};
+    lay.xaxis.range=[d.x[i0],plus(endx,2*L.interval)];lay.yaxis={range:[lo-pad,hi+pad]};
   }
   Plotly.react("chart",[{type:"candlestick",...d,name:"actual 1-min"},...fc()],lay,{responsive:true});
 }
@@ -235,7 +246,7 @@ function drawCmp(){
   if(!CMP)return;
   const rows=CMP.rows,sm=$("indep").checked?CMP.summary_indep:CMP.summary_all;
   const nc=$("bNC").checked,vb=$("bVB").checked,st=CMP.settings;
-  $("cmpnote").textContent="Origin "+CMP.origin.slice(11,16)+" | "+CMP.n_revealed+" revealed bars | input "+st.input_form+" | covariates "+st.covariates+" | ctx "+st.context_len+" | values are predicted bar CLOSES, shown at the bar's open stamp | err = forecast - actual | latest = last forecast made before the bar was revealed (lag "+CMP.lag+") | shaded rows: latest is the initial forecast itself";
+  $("cmpnote").textContent="Origin "+CMP.origin.slice(11,16)+" | "+CMP.interval+"-min bars | "+CMP.n_revealed+" revealed bars | input "+st.input_form+" | covariates "+st.covariates+" | ctx "+st.context_len+" bars | values are predicted bar CLOSES, shown at the bar's open stamp | err = forecast - actual | latest = last forecast made before the bar was revealed (lag "+CMP.lag+") | shaded rows: latest is the initial forecast itself";
   $("warn").textContent=CMP.band_approx?"Log-returns input: P10-P90 bands are an approximation (quantiles of each step summed). Median and MAE are fine to compare; coverage and pinball are not comparable with the other input forms.":"";
   $("cmpsum").innerHTML=summaryHtml(sm);
   const x=rows.map(r=>r.target.slice(0,19).replace("T"," "));
@@ -260,6 +271,9 @@ function drawCmp(){
 }
 
 fetch("/api/meta").then(r=>r.json()).then(m=>{
+  META=m;
+  m.intervals.forEach(i=>{const o=document.createElement("option");o.value=i;o.textContent=i+" min";$("iv").appendChild(o)});
+  $("iv").value=1;onInterval();say("");
   m.symbols.forEach(s=>{const o=document.createElement("option");o.textContent=s;$("symbol").appendChild(o)});
   if(m.latest)$("date").value=m.latest;
 });

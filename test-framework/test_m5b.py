@@ -59,7 +59,7 @@ def pure_tests():
     q = np.full((3, 9), 10.0)
     check("S6 log returns back: 10 bps/step -> last*exp(0.003) at step 3", near(back(q)[2, 4], 112.0 * np.exp(0.003), 1e-8))
     check("S7 log returns back: zero returns -> flat at last close", np.allclose(back(np.zeros((3, 9))), 112.0))
-    st = {**eg.DEFAULT_SETTINGS, "input_form": "raw_close"}
+    st = {**eg.DEFAULT_SETTINGS, "input_form": "raw_close", "covariates": "none"}   # DEFAULT_SETTINGS now has time_of_day
     x, cov, back = eg.prepare_input(df, T, st, 2)
     check("S8 raw close input unchanged, no covariate", np.array_equal(x, df["close"].to_numpy()) and cov is None)
 

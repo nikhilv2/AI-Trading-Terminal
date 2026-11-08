@@ -13,7 +13,7 @@ MIN = pd.Timedelta(minutes=1)
 QLEVELS = np.array([0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9])
 P10, MED, P90 = 0, 4, 8
 Z = np.array([NormalDist().inv_cdf(float(p)) for p in QLEVELS])
-VOL_N = 60        # up to this many recent 1-minute returns
+VOL_N = 60        # up to this many recent bar returns (bars of whatever interval the replay holds)
 VOL_MIN = 10      # fewer than this -> baseline unavailable (None)
 
 
@@ -41,8 +41,9 @@ def _dir(ref, fc, actual):
 
 def vol_band(rp, T, steps):
     """Volatility-band baseline made at origin T from bars CLOSED at or before T.
-    Median = last close. Spread = RMS of the last up to VOL_N same-session 1-minute log returns
-    x sqrt(h), h = 1..steps, normal quantiles, linear in price.
+    Median = last close. Spread = RMS of the last up to VOL_N same-session bar-to-bar log returns
+    x sqrt(h), h = 1..steps BARS, normal quantiles, linear in price. Works for any bar interval because it
+    only uses the bars the replay holds (1-minute bars for interval 1, resampled bars otherwise).
     Returns (anchor, q) with q shape (steps, 9), or (anchor, None) if fewer than VOL_MIN returns."""
     ctx = rp.context(T, VOL_N + 1)
     c = ctx["close"].to_numpy(dtype=np.float64)
@@ -59,20 +60,22 @@ def vol_band(rp, T, steps):
 
 def compare(snaps, rp, lag=0):
     """snaps: snapshots of ONE run in seq order (snaps[0] = initial). rp: engine.Replay.
-    Row j = bar opening at T0+j. 'latest' = snapshot with seq max(j-lag,0), step j-seq."""
+    Row j = bar opening at T0 + j bars. 'latest' = snapshot with seq max(j-lag,0), step j-seq.
+    The bar length comes from the snapshot ("interval" minutes; snapshots without it are 1-minute)."""
     if len(snaps) < 2:
         raise ValueError("need the initial snapshot plus at least one update")
     ini = snaps[0]
     if ini["kind"] != "initial":
         raise ValueError("snaps[0] is not the initial snapshot")
     T0 = pd.Timestamp(ini["origin_ts"]).tz_convert(IST)
+    STEP = pd.Timedelta(minutes=int(ini.get("interval", 1)))
     n_rev = len(snaps) - 1
-    T_last = T0 + n_rev * MIN                      # last forecast origin = reveal horizon
+    T_last = T0 + n_rev * STEP                      # last forecast origin = reveal horizon
     anchor0 = float(rp.context(T0, 1)["close"].iloc[-1])
     _, vb0 = vol_band(rp, T0, ini["horizon"])
     rows = []
     for j in range(n_rev):
-        t = T0 + j * MIN
+        t = T0 + j * STEP
         bar = rp.bar_opening_at(t)
         if bar is None or bar["ts_close"] > T_last:   # never score a bar that has not been revealed
             break
@@ -101,7 +104,7 @@ def compare(snaps, rp, lag=0):
             raise ValueError(f"snapshot {seq} step {idx} does not point at {t}")
         ql = s["quantiles"][idx]
         l10, l50, l90 = ql[P10], ql[MED], ql[P90]
-        T_or = T0 + seq * MIN
+        T_or = T0 + seq * STEP
         anchor_roll, vbl = vol_band(rp, T_or, idx + 1)
         if vbl is not None:
             v = vbl[idx]
@@ -124,7 +127,8 @@ def compare(snaps, rp, lag=0):
             "vb_init_p10": vi10, "vb_init_p90": vi90, "in_vb_init": in_vi, "pin_vb_init": pv_i,
             "vb_latest_p10": vl10, "vb_latest_p90": vl90, "in_vb_latest": in_vl, "pin_vb_latest": pv_l})
 
-    return {"rows": rows, "lag": lag, "origin": T0.isoformat(), "n_revealed": len(rows),
+    return {"rows": rows, "lag": lag, "origin": T0.isoformat(), "interval": int(ini.get("interval", 1)),
+            "n_revealed": len(rows),
             "anchor_T0": anchor0,
             "summary_all": summarize(rows),
             "summary_indep": summarize([r for r in rows if not r["latest_is_initial"]])}

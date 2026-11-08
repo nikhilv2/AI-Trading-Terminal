@@ -1,16 +1,32 @@
 Run step
 
 Run server: D:\timesfm3\timesfm3-studio\.venv\Scripts\python.exe -m uvicorn server:app --host 127.0.0.1 --port 8000
+  (GUI: pick Interval 1/5/10/15/30 min; context, horizon and run length reset to sensible values for that bar size;
+   a start time that is not on the bar grid 09:15 + n x interval is moved to the next boundary)
 
+ cd "D:\timesfm3\AI trading terminal\test-framework"
+ 
 # 1. First make sure data is cached
 D:\timesfm3\timesfm3-studio\.venv\Scripts\python.exe m1_check.py          # or m5a_check.py
 
 # 2. Run unit tests (optional but recommended)
-D:\timesfm3\timesfm3-studio\.venv\Scripts\python.exe test_m5b.py --skip-model     # pure logic tests (fast)
-D:\timesfm3\timesfm3-studio\.venv\Scripts\python.exe test_m5b.py                  # full tests including model
+D:\timesfm3\timesfm3-studio\.venv\Scripts\python.exe test_intervals.py                   # bar-interval tests: resampling, no look-ahead, grid, server, paired_eval (offline, fast)
+D:\timesfm3\timesfm3-studio\.venv\Scripts\python.exe test_m5b.py --skip-model            # pure logic tests (fast)
+D:\timesfm3\timesfm3-studio\.venv\Scripts\python.exe test_m5b.py                         # full tests including model
+D:\timesfm3\timesfm3-studio\.venv\Scripts\python.exe test_no_lookahead.py --interval 15  # real-model leak check at a given bar size (repeat for 1 5 10 15 30)
+D:\timesfm3\timesfm3-studio\.venv\Scripts\python.exe paired_eval.py selftest             # plumbing check with a mock model
 
-# 3. Run a simulation with the new defaults
-D:\timesfm3\timesfm3-studio\.venv\Scripts\python.exe run_sim.py --symbol NIFTY50 --time 10:30 --horizon 10 --steps 15
+# 3. Run a simulation (bars = --interval minutes; horizon / steps / ctx are in bars and default per interval)
+D:\timesfm3\timesfm3-studio\.venv\Scripts\python.exe run_sim.py --symbol NIFTY50 --time 10:30 --interval 5
+D:\timesfm3\timesfm3-studio\.venv\Scripts\python.exe run_sim.py --symbol NIFTY50 --time 10:30 --interval 1 --horizon 10 --steps 15
 
-# 4. Run your ablation (since you already added ablate.py)
-D:\timesfm3\timesfm3-studio\.venv\Scripts\python.exe ablate.py
+# 4. Quick screen over combinations (skips the pruned combos; writes data/ablation_intervals_<stamp>.json)
+D:\timesfm3\timesfm3-studio\.venv\Scripts\python.exe ablate.py --intervals 5 10 15 30
+D:\timesfm3\timesfm3-studio\.venv\Scripts\python.exe ablate.py --analyse data\ablation_intervals_<stamp>.json      # re-read saved results, no model needed
+
+# 5. Rigorous paired evaluation across bar sizes (use a NEW tag; old 1-minute tags can be summarized but not extended)
+D:\timesfm3\timesfm3-studio\.venv\Scripts\python.exe paired_eval.py run --symbol NIFTY50 --days-limit 120 --every 30 --intervals 5 10 15 30 --tag NIFTY50_intervals
+D:\timesfm3\timesfm3-studio\.venv\Scripts\python.exe paired_eval.py run --symbol NIFTY50 --days-limit 120 --every 30 --intervals 1 5 10 15 30   # include 1-min for one tag
+D:\timesfm3\timesfm3-studio\.venv\Scripts\python.exe paired_eval.py summarize --tag NIFTY50_intervals             # headline table across intervals
+D:\timesfm3\timesfm3-studio\.venv\Scripts\python.exe paired_eval.py summarize --tag NIFTY50_intervals --detail    # plus per-interval detail
+# Retired variants (C_logret_none, E_raw_tod) are not run; add --include-retired to re-test them.

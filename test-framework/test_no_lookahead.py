@@ -13,14 +13,16 @@ def main():
     ap.add_argument("--symbol", default="NIFTY50")
     ap.add_argument("--date")
     ap.add_argument("--time", default="11:00")
-    ap.add_argument("--ctx", type=int, default=2048)
+    ap.add_argument("--interval", type=int, default=1, choices=list(eg.INTERVALS), help="bar size in minutes")
+    ap.add_argument("--ctx", type=int, default=2048, help="context length in bars")
     ap.add_argument("--horizon", type=int, default=10)
     ap.add_argument("--skip-model", action="store_true")
     a = ap.parse_args()
     day = date.fromisoformat(a.date) if a.date else eg.latest_cached_day(a.symbol)
-    T = eg.make_ts(day, a.time)
-    settings = {**eg.DEFAULT_SETTINGS, "context_len": a.ctx}
-    bars = eg.load_history(a.symbol, day, a.ctx)
+    T = eg.snap_to_grid(eg.make_ts(day, a.time), a.interval)      # origins sit on the bar grid
+    step = eg.step_of(a.interval)
+    settings = {**eg.DEFAULT_SETTINGS, "context_len": a.ctx, "interval": a.interval}
+    bars = eg.load_history(a.symbol, day, a.ctx, a.interval)
     rp = eg.Replay(bars)
     results = []
 
@@ -33,7 +35,7 @@ def main():
     last = ctx.iloc[-1]
     check("T1 last context bar closed at or before T", last["ts_close"] <= T,
           f"last open {last['ts_open']:%H:%M}, close {last['ts_close']:%H:%M}, T {T:%H:%M}")
-    check("T1 last context bar opened exactly 1 minute before T", last["ts_open"] == T - eg.MIN)
+    check(f"T1 last context bar opened exactly {a.interval} minute(s) before T", last["ts_open"] == T - step)
     check("T1 no context bar opens at or after T", int((ctx["ts_open"] >= T).sum()) == 0)
     future = bars[bars["ts_open"] >= T]
     check("T1 future bars exist in the data but are excluded", len(future) > 0, f"{len(future)} future bars")
@@ -75,7 +77,7 @@ def main():
         check("T4 negative control: a deliberate leak IS detected by this test", dl > tol, f"max|diff|={dl:.3f}")
 
     print("\n==================== RESULT SUMMARY (M2 test) ====================")
-    print(f"{sum(results)}/{len(results)} checks passed  (symbol {a.symbol}, T={T}, ctx={a.ctx})")
+    print(f"{sum(results)}/{len(results)} checks passed  (symbol {a.symbol}, T={T}, interval={a.interval} min, ctx={a.ctx} bars)")
     print("ALL PASS" if all(results) else "SOME FAILED")
     print("==================================================================")
 

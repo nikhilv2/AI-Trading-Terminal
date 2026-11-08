@@ -5,6 +5,11 @@ Improvements for accuracy:
 - Default to log_price_stitched + time_of_day
 - Support for volume / range / combined covariates
 - Multi-covariate support in ModelRunner
+
+Bar interval: the cache holds 1-minute bars. `settings["interval"]` (1, 5, 10, 15 or 30 minutes) makes the
+engine run on resampled bars instead. Everything downstream (context, covariates, horizon, snapshots, metrics)
+counts in BARS of that interval. A bar only exists once all of its 1-minute bars have closed, so resampling
+cannot leak the future (see resample_bars and test_intervals.py).
 """
 import hashlib
 import json
@@ -22,7 +27,8 @@ import upstox_data as ud
 
 IST = ud.IST
 RUNS = ud.DATA / "runs"
-BARS_PER_DAY = 375
+BARS_PER_DAY = 375                  # 1-minute bars per session (09:15..15:29)
+INTERVALS = (1, 5, 10, 15, 30)      # allowed bar sizes in minutes; beyond 30 the regime shifts too much to be useful
 QLEVELS = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
 MEDIAN_IDX = 4
 STUDIO = Path(os.getenv("TIMESFM_STUDIO_DIR", r"D:\timesfm3\timesfm3-studio"))
@@ -32,7 +38,18 @@ COVARIATES = ("none", "time_of_day", "volume", "range", "tod_volume")
 DEFAULT_SETTINGS = {
     "context_len": 2048,
     "input_form": "log_price_stitched",   # better than raw_close for financial data
-    "covariates": "time_of_day"           # free known-future signal
+    "covariates": "time_of_day",          # free known-future signal
+    "interval": 1,                        # bar size in minutes, one of INTERVALS
+}
+# Starting points per interval (context in BARS, horizon in BARS, run length in BARS). Coarser bars cover more
+# wall-clock time per bar, so a smaller context keeps the window to roughly 2-4 weeks of sessions, which also
+# limits regime drift and the amount of history that has to be fetched.
+INTERVAL_DEFAULTS = {
+    1:  {"context_len": 2048, "horizon": 10, "steps": 10},   # ~5.5 sessions
+    5:  {"context_len": 1024, "horizon": 6,  "steps": 12},   # ~14 sessions, +30 min
+    10: {"context_len": 512,  "horizon": 3,  "steps": 6},    # ~14 sessions, +30 min
+    15: {"context_len": 512,  "horizon": 3,  "steps": 6},    # ~20 sessions, +45 min
+    30: {"context_len": 256,  "horizon": 3,  "steps": 6},    # ~21 sessions, +90 min
 }
 MIN = pd.Timedelta(minutes=1)
 BPS = 1e4
@@ -53,10 +70,65 @@ def latest_cached_day(sym):
     return date.fromisoformat(files[-1].stem)
 
 
-def load_history(sym, day, context_len):
-    """Bars for `day` plus enough earlier sessions to fill context_len bars (all from the M1 cache)."""
-    days_back = max(10, int(context_len / BARS_PER_DAY * 2) + 8)
-    return ud.get_range(sym, day - timedelta(days=days_back), day)
+def check_interval(interval):
+    if interval not in INTERVALS:
+        raise ValueError(f"interval must be one of {INTERVALS} minutes, got {interval!r}")
+    return int(interval)
+
+
+def bars_per_day(interval=1):
+    """Complete bars per session. 375 is not divisible by 10 or 30, so the trailing partial bar is dropped
+    (10 min: 37 bars, last one 15:15-15:25; 30 min: 12 bars, last one 14:45-15:15)."""
+    return BARS_PER_DAY // check_interval(interval)
+
+
+def step_of(settings_or_interval):
+    """Bar length as a Timedelta. Accepts a settings dict or an int number of minutes."""
+    iv = settings_or_interval.get("interval", 1) if isinstance(settings_or_interval, dict) else settings_or_interval
+    return pd.Timedelta(minutes=check_interval(iv))
+
+
+def snap_to_grid(T, interval):
+    """First bar boundary at or after T. Bars of size `interval` open at 09:15 + n * interval."""
+    iv = check_interval(interval)
+    open_ = make_ts(T.date(), "09:15")
+    m = int((T - open_).total_seconds() // 60)
+    return open_ + pd.Timedelta(minutes=-(-m // iv) * iv)
+
+
+def resample_bars(bars, interval):
+    """1-minute bars -> `interval`-minute bars, same columns as the cache (ts_open, ts_close, open, high, low,
+    close, volume, oi). Buckets are anchored at 09:15 and never cross a session boundary.
+
+    Only COMPLETE buckets are kept (all `interval` one-minute bars present). So a resampled bar with
+    ts_close = C is built only from 1-minute bars that closed at or before C, which keeps the replay rule
+    "context = bars with ts_close <= T" free of look-ahead. The trailing partial bucket of a session and any
+    bucket with a missing minute are dropped (the latter shows up as a gap, which paired_eval's
+    contiguity check and the 'data gap' stop in run_simulation already handle)."""
+    iv = check_interval(interval)
+    if iv == 1:
+        return bars
+    b = bars.sort_values("ts_open").drop_duplicates("ts_open")
+    mins = (b["ts_open"].dt.hour * 60 + b["ts_open"].dt.minute - SESSION_OPEN_MIN).to_numpy()
+    b = b[(mins >= 0) & (mins <= SESSION_SPAN)].copy()
+    if b.empty:
+        return b.reset_index(drop=True)
+    b["_d"] = b["ts_open"].dt.date
+    b["_b"] = ((b["ts_open"].dt.hour * 60 + b["ts_open"].dt.minute - SESSION_OPEN_MIN) // iv).astype(int)
+    g = b.groupby(["_d", "_b"], sort=True)
+    out = g.agg(ts_open=("ts_open", "first"), open=("open", "first"), high=("high", "max"),
+                low=("low", "min"), close=("close", "last"), volume=("volume", "sum"),
+                oi=("oi", "last"), n=("ts_open", "size"))
+    out = out[out["n"] == iv].reset_index(drop=True)
+    out["ts_close"] = out["ts_open"] + pd.Timedelta(minutes=iv)
+    return out[ud.COLS].sort_values("ts_open").reset_index(drop=True)
+
+
+def load_history(sym, day, context_len, interval=1):
+    """Bars (of size `interval` minutes) for `day` plus enough earlier sessions to fill context_len bars
+    (all from the M1 cache, resampled from the 1-minute bars)."""
+    days_back = max(10, int(context_len / bars_per_day(interval) * 2) + 8)
+    return resample_bars(ud.get_range(sym, day - timedelta(days=days_back), day), interval)
 
 
 # ---------------------------------------------------------------- replay: the ONLY gateway to context
@@ -65,7 +137,7 @@ class Replay:
         self.bars = bars.sort_values("ts_open").reset_index(drop=True)
 
     def closed_until(self, T):
-        """Bars that have CLOSED at or before T. Bar-open stamps: ts_close = ts_open + 1 min."""
+        """Bars that have CLOSED at or before T. Bar-open stamps: ts_close = ts_open + one bar (1 min, or the interval)."""
         return self.bars[self.bars["ts_close"] <= T]
 
     def context(self, T, n):
@@ -86,6 +158,7 @@ def check_settings(s):
         raise ValueError(f"input_form must be one of {INPUT_FORMS}, got {s.get('input_form')!r}")
     if s.get("covariates") not in COVARIATES:
         raise ValueError(f"covariates must be one of {COVARIATES}, got {s.get('covariates')!r}")
+    check_interval(s.get("interval", 1))
 
 
 def _session_returns(ctx_df):
@@ -105,9 +178,11 @@ def _session_returns(ctx_df):
     return np.log(c / base)
 
 
-def _tod_cov(ctx_df, T, horizon):
-    """Time-of-day covariate, shape (1, ctx+horizon). Depends on timestamps only (known in advance)."""
-    stamps = list(ctx_df["ts_open"]) + [T + i * MIN for i in range(horizon)]
+def _tod_cov(ctx_df, T, horizon, interval=1):
+    """Time-of-day covariate, shape (1, ctx+horizon). Depends on timestamps only (known in advance).
+    Future bars are `interval` minutes apart. The value is minutes since 09:15 / 374 whatever the interval,
+    so the same clock time has the same value at every interval."""
+    stamps = list(ctx_df["ts_open"]) + [T + i * step_of(interval) for i in range(horizon)]
     mins = np.array([t.hour * 60 + t.minute - SESSION_OPEN_MIN for t in stamps], dtype=np.float64)
     return (mins / SESSION_SPAN)[None, :].astype(np.float32)
 
@@ -143,6 +218,7 @@ def prepare_input(ctx_df, T, settings, horizon):
     """
     check_settings(settings)
     form, cov_mode = settings["input_form"], settings["covariates"]
+    iv = settings.get("interval", 1)
     close = ctx_df["close"].to_numpy(dtype=np.float64)
     last = float(close[-1])
 
@@ -162,13 +238,13 @@ def prepare_input(ctx_df, T, settings, horizon):
     if cov_mode == "none":
         cov = None
     elif cov_mode == "time_of_day":
-        cov = _tod_cov(ctx_df, T, horizon)
+        cov = _tod_cov(ctx_df, T, horizon, iv)
     elif cov_mode == "volume":
         cov = _volume_cov(ctx_df, T, horizon)
     elif cov_mode == "range":
         cov = _range_cov(ctx_df, T, horizon)
     elif cov_mode == "tod_volume":
-        tod = _tod_cov(ctx_df, T, horizon)
+        tod = _tod_cov(ctx_df, T, horizon, iv)
         vol = _volume_cov(ctx_df, T, horizon)
         cov = np.concatenate([tod, vol], axis=0)  # (2, ctx+horizon)
     else:
@@ -263,6 +339,20 @@ def _sha(s):
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
 
+def make_run_dir(stem):
+    """Create RUNS/<stem>_<HHMMSS>. Fast runs (short horizon, small context) can start within the same second,
+    so if that name is taken, -1, -2, ... is appended instead of failing with 'File exists'."""
+    base = f"{stem}_{datetime.now():%H%M%S}"
+    for n in range(1000):
+        rd = RUNS / (base if n == 0 else f"{base}-{n}")
+        try:
+            rd.mkdir(parents=True, exist_ok=False)
+            return rd
+        except FileExistsError:
+            continue
+    raise RuntimeError(f"could not create a unique run directory for {base}")
+
+
 def _write_once(path, obj):
     with open(path, "x", encoding="utf-8") as fh:       # 'x' = fail if the file exists
         json.dump(obj, fh, indent=1)
@@ -298,23 +388,31 @@ def verify_run(run_dir):
 
 # ---------------------------------------------------------------- simulation (command line)
 def run_simulation(runner, sym, day, start_hhmm, horizon=10, n_steps=10, settings=None, log=print):
+    """horizon and n_steps are counted in BARS of settings["interval"] minutes."""
     settings = {**DEFAULT_SETTINGS, **(settings or {})}
     check_settings(settings)
+    iv = settings["interval"]
+    step = step_of(iv)
     T0 = make_ts(day, start_hhmm)
     end_ts = make_ts(day, "15:30")
     if not (make_ts(day, "09:15") <= T0 < end_ts):
         raise SystemExit("start time must be 09:15..15:29")
-    bars = load_history(sym, day, settings["context_len"])
+    T0g = snap_to_grid(T0, iv)
+    if T0g >= end_ts:
+        raise SystemExit(f"no {iv}-min bar boundary between {start_hhmm} and 15:30; start earlier")
+    if T0g != T0:
+        log(f"  start {start_hhmm} is not on a {iv}-min bar boundary (09:15 + n*{iv}); using {T0g:%H:%M}")
+        T0, start_hhmm = T0g, f"{T0g:%H:%M}"
+    bars = load_history(sym, day, settings["context_len"], iv)
     if bars[bars["ts_open"].dt.date == day].empty:
         raise SystemExit(f"No cached bars for {day} (today is never cached; pick a past trading day).")
     rp = Replay(bars)
 
-    run_dir = RUNS / f"{sym}_{day}_{start_hhmm.replace(':', '')}_h{horizon}_c{settings['context_len']}_{datetime.now():%H%M%S}"
-    run_dir.mkdir(parents=True, exist_ok=False)
+    run_dir = make_run_dir(f"{sym}_{day}_{start_hhmm.replace(':', '')}_i{iv}_h{horizon}_c{settings['context_len']}")
     _write_once(run_dir / "run.json", {
-        "symbol": sym, "date": str(day), "start": start_hhmm, "horizon": horizon,
+        "symbol": sym, "date": str(day), "start": start_hhmm, "interval": iv, "horizon": horizon,
         "n_steps_requested": n_steps, "settings": settings, "model": runner.info,
-        "bar_convention": "ts_open = bar open; context = bars with ts_close <= origin",
+        "bar_convention": "ts_open = bar open; context = bars with ts_close <= origin; bar = `interval` minutes",
         "created": datetime.now(IST).isoformat()})
 
     snaps = []
@@ -326,8 +424,8 @@ def run_simulation(runner, sym, day, start_hhmm, horizon=10, n_steps=10, setting
             "last_context_bar_open": ctx["ts_open"].iloc[-1].isoformat(),
             "n_context_bars": int(len(ctx)),
             "context_sha256": hashlib.sha256(ctx["close"].to_numpy(np.float64).tobytes()).hexdigest(),
-            "horizon": horizon,
-            "target_open_ts": [(T + i * MIN).isoformat() for i in range(horizon)],
+            "interval": iv, "horizon": horizon,
+            "target_open_ts": [(T + i * step).isoformat() for i in range(horizon)],
             "quantile_levels": QLEVELS, "quantiles": q.tolist(), "median": q[:, MEDIAN_IDX].tolist(),
             "quantile_crossing": bool(np.any(np.diff(q, axis=1) < 0)),
             "band_approx": settings["input_form"] == "log_returns",
@@ -340,7 +438,7 @@ def run_simulation(runner, sym, day, start_hhmm, horizon=10, n_steps=10, setting
 
     make(0, "initial", T0)
     for k in range(1, n_steps + 1):
-        Tk = T0 + k * MIN                      # the bar that opened at Tk-1 has just closed
+        Tk = T0 + k * step                     # the bar that opened at Tk-step has just closed
         if Tk >= end_ts:
             log("  session end reached")
             break
